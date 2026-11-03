@@ -664,11 +664,11 @@ na_ucx_addr_map_update(struct na_ucx_class *na_ucx_class,
     struct na_ucx_map *na_ucx_map, struct na_ucx_addr *na_ucx_addr);
 
 /**
- * Remove addr from map using addr_key.
+ * Remove addr from map, only the entries that are addr itself.
  */
 static na_return_t
 na_ucx_addr_map_remove(
-    struct na_ucx_map *na_ucx_map, ucs_sock_addr_t *addr_key, ucp_ep_h ep);
+    struct na_ucx_map *na_ucx_map, struct na_ucx_addr *na_ucx_addr);
 
 /**
  * Hash packed worker address key.
@@ -3002,27 +3002,32 @@ unlock:
 /*---------------------------------------------------------------------------*/
 static na_return_t
 na_ucx_addr_map_remove(
-    struct na_ucx_map *na_ucx_map, ucs_sock_addr_t *addr_key, ucp_ep_h ep)
+    struct na_ucx_map *na_ucx_map, struct na_ucx_addr *na_ucx_addr)
 {
     na_return_t ret = NA_SUCCESS;
     int rc;
 
     hg_thread_rwlock_wrlock(&na_ucx_map->lock);
 
-    if (hg_hash_table_lookup(na_ucx_map->key_map,
-            (hg_hash_table_key_t) addr_key) == HG_HASH_TABLE_NULL)
-        goto unlock;
+    /* The key may now belong to a newer addr, leave it alone */
+    if ((struct na_ucx_addr *) hg_hash_table_lookup(na_ucx_map->key_map,
+            (hg_hash_table_key_t) &na_ucx_addr->addr_key) == na_ucx_addr) {
+        /* Remove addr key from primary map */
+        rc = hg_hash_table_remove(
+            na_ucx_map->key_map, (hg_hash_table_key_t) &na_ucx_addr->addr_key);
+        NA_CHECK_SUBSYS_ERROR(addr, rc != 1, unlock, ret, NA_NOENTRY,
+            "hg_hash_table_remove() failed");
+    }
 
-    /* Remove addr key from primary map */
-    rc = hg_hash_table_remove(
-        na_ucx_map->key_map, (hg_hash_table_key_t) addr_key);
-    NA_CHECK_SUBSYS_ERROR(addr, rc != 1, unlock, ret, NA_NOENTRY,
-        "hg_hash_table_remove() failed");
-
-    /* Remove EP handle from secondary map */
-    rc = hg_hash_table_remove(na_ucx_map->ep_map, (hg_hash_table_key_t) ep);
-    NA_CHECK_SUBSYS_ERROR(addr, rc != 1, unlock, ret, NA_NOENTRY,
-        "hg_hash_table_remove() failed");
+    /* Remove EP handle from secondary map, even if the key was reused */
+    if (na_ucx_addr->ucp_ep != NULL &&
+        (struct na_ucx_addr *) hg_hash_table_lookup(na_ucx_map->ep_map,
+            (hg_hash_table_key_t) na_ucx_addr->ucp_ep) == na_ucx_addr) {
+        rc = hg_hash_table_remove(
+            na_ucx_map->ep_map, (hg_hash_table_key_t) na_ucx_addr->ucp_ep);
+        NA_CHECK_SUBSYS_ERROR(addr, rc != 1, unlock, ret, NA_NOENTRY,
+            "hg_hash_table_remove() failed");
+    }
 
 unlock:
     hg_thread_rwlock_release_wrlock(&na_ucx_map->lock);
@@ -3245,8 +3250,8 @@ na_ucx_addr_release(struct na_ucx_addr *na_ucx_addr, bool force,
     if (na_ucx_addr->addr_key.addr) {
         NA_UCX_PRINT_ADDR_KEY_INFO("Removing address", &na_ucx_addr->addr_key);
 
-        na_ucx_addr_map_remove(&na_ucx_addr->na_ucx_class->addr_map,
-            &na_ucx_addr->addr_key, na_ucx_addr->ucp_ep);
+        na_ucx_addr_map_remove(
+            &na_ucx_addr->na_ucx_class->addr_map, na_ucx_addr);
     }
 
     /* Must be removed before worker_addr is released, the key points to it */
