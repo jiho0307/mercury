@@ -56,6 +56,8 @@
 
 /* Addr status bits */
 #define NA_UCX_ADDR_RESOLVED (1 << 0)
+#define NA_UCX_ADDR_CONN_REF (1 << 1) /* Connection reference is held */
+#define NA_UCX_ADDR_STALE    (1 << 2) /* Replaced by a new connection */
 
 /* Timeout (ms) until we give up on connection */
 #define NA_UCX_ADDR_CONN_TIMEOUT (120 * 1000)
@@ -669,6 +671,13 @@ na_ucx_addr_map_update(struct na_ucx_class *na_ucx_class,
 static na_return_t
 na_ucx_addr_map_remove(
     struct na_ucx_map *na_ucx_map, struct na_ucx_addr *na_ucx_addr);
+
+/**
+ * Unlink a stale incoming addr from the key map and drop its connection
+ * reference, so that a new connection from the same address can be accepted.
+ */
+static void
+na_ucx_addr_map_evict(struct na_ucx_map *na_ucx_map, ucs_sock_addr_t *addr_key);
 
 /**
  * Hash packed worker address key.
@@ -1796,6 +1805,10 @@ na_ucp_listener_conn_cb(ucp_conn_request_h conn_request, void *arg)
         .addr = (const struct sockaddr *) &conn_request_attrs.client_address,
         .addrlen = sizeof(conn_request_attrs.client_address)};
 
+    /* An entry left by a previous incoming connection is stale */
+    if (na_ucx_addr_map_lookup(&na_ucx_class->addr_map, &addr_key) != NULL)
+        na_ucx_addr_map_evict(&na_ucx_class->addr_map, &addr_key);
+
     if (na_ucx_addr_map_lookup(&na_ucx_class->addr_map, &addr_key) == NULL) {
         /* Insert new entry and create new address */
         na_return_t ret =
@@ -2080,11 +2093,12 @@ na_ucp_ep_error_cb(void *arg, ucp_ep_h NA_DEBUG_LOG_USED ep,
         "ep_err_handler(ep=%p) returned (%s) for address (%p)", (void *) ep,
         ucs_status_string(status), (void *) na_ucx_addr);
 
-    /* Mark addr as no longer resolved to force reconnection */
-    hg_atomic_and32(&na_ucx_addr->status, ~NA_UCX_ADDR_RESOLVED);
-
-    /* Will schedule removal of address */
-    na_ucx_addr_ref_decr(na_ucx_addr);
+    /* Mark addr as no longer resolved to force reconnection, and drop the
+     * connection reference unless a stale entry eviction already did */
+    if (hg_atomic_and32(&na_ucx_addr->status,
+            ~(NA_UCX_ADDR_RESOLVED | NA_UCX_ADDR_CONN_REF)) &
+        NA_UCX_ADDR_CONN_REF)
+        na_ucx_addr_ref_decr(na_ucx_addr); /* Will schedule removal */
 }
 
 /*---------------------------------------------------------------------------*/
@@ -2947,6 +2961,7 @@ na_ucx_addr_map_update(struct na_ucx_class *na_ucx_class,
 {
     void *request = NULL;
     na_return_t ret = NA_SUCCESS;
+    bool took_ref = false;
     int rc;
 
     hg_thread_rwlock_wrlock(&na_ucx_map->lock);
@@ -2970,6 +2985,13 @@ na_ucx_addr_map_update(struct na_ucx_class *na_ucx_class,
     NA_CHECK_SUBSYS_ERROR(addr, request != NULL, unlock, ret, NA_BUSY,
         "Could not close UCP endpoint");
 
+    /* Retake refcount taken away from previous disconnect, before the new EP
+     * can report an error */
+    took_ref = !(hg_atomic_or32(&na_ucx_addr->status, NA_UCX_ADDR_CONN_REF) &
+                 NA_UCX_ADDR_CONN_REF);
+    if (took_ref)
+        na_ucx_addr_ref_incr(na_ucx_addr);
+
     /* Create new endpoint */
     ret = na_ucp_connect(na_ucx_class->ucp_worker,
         na_ucx_class->self_addr->addr_key.addr, na_ucx_addr->addr_key.addr,
@@ -2988,12 +3010,16 @@ na_ucx_addr_map_update(struct na_ucx_class *na_ucx_class,
     NA_CHECK_SUBSYS_ERROR(
         addr, rc == 0, unlock, ret, NA_NOMEM, "hg_hash_table_insert() failed");
 
-    /* Retake refcount taken away from previous disconnect */
-    na_ucx_addr_ref_incr(na_ucx_addr);
-
     hg_atomic_or32(&na_ucx_addr->status, NA_UCX_ADDR_RESOLVED);
 
 unlock:
+    /* No connection, give back the reference unless an EP error already did.
+     * The caller still holds a reference, so this is never the last one. */
+    if (ret != NA_SUCCESS && took_ref &&
+        (hg_atomic_and32(&na_ucx_addr->status, ~NA_UCX_ADDR_CONN_REF) &
+            NA_UCX_ADDR_CONN_REF))
+        na_ucx_addr_ref_decr(na_ucx_addr);
+
     hg_thread_rwlock_release_wrlock(&na_ucx_map->lock);
 
     return ret;
@@ -3033,6 +3059,49 @@ unlock:
     hg_thread_rwlock_release_wrlock(&na_ucx_map->lock);
 
     return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+static void
+na_ucx_addr_map_evict(struct na_ucx_map *na_ucx_map, ucs_sock_addr_t *addr_key)
+{
+    struct na_ucx_addr *na_ucx_addr;
+    bool evicted = false, conn_ref = false;
+    char host_string[NI_MAXHOST];
+    char serv_string[NI_MAXSERV];
+
+    hg_thread_rwlock_wrlock(&na_ucx_map->lock);
+
+    na_ucx_addr = (struct na_ucx_addr *) hg_hash_table_lookup(
+        na_ucx_map->key_map, (hg_hash_table_key_t) addr_key);
+
+    /* Only incoming connections are replaced. The EP is left as is and is
+     * force closed when the last reference to addr is released. */
+    if (na_ucx_addr != HG_HASH_TABLE_NULL && !na_ucx_addr->connect) {
+        (void) hg_hash_table_remove(
+            na_ucx_map->key_map, (hg_hash_table_key_t) addr_key);
+        hg_atomic_or32(&na_ucx_addr->status, NA_UCX_ADDR_STALE);
+        conn_ref =
+            (hg_atomic_and32(&na_ucx_addr->status, ~NA_UCX_ADDR_CONN_REF) &
+                NA_UCX_ADDR_CONN_REF) != 0;
+        evicted = true;
+    }
+
+    hg_thread_rwlock_release_wrlock(&na_ucx_map->lock);
+
+    if (!evicted)
+        return;
+
+    (void) getnameinfo(addr_key->addr, addr_key->addrlen, host_string,
+        sizeof(host_string), serv_string, sizeof(serv_string),
+        NI_NUMERICHOST | NI_NUMERICSERV);
+    NA_LOG_SUBSYS_WARNING(addr, "Replacing stale entry for address (%s:%s)",
+        host_string, serv_string);
+
+    /* Last reference calls map_remove(), must not hold the lock. Without
+     * the connection reference, addr may be gone already. */
+    if (conn_ref)
+        na_ucx_addr_ref_decr(na_ucx_addr);
 }
 
 /*---------------------------------------------------------------------------*/
@@ -3272,9 +3341,12 @@ na_ucx_addr_release(struct na_ucx_addr *na_ucx_addr, bool force,
     }
 
     if (na_ucx_addr->ucp_ep != NULL) {
-        /* Close endpoint (if force is not passed, operations will flush) */
-        na_ucp_ep_close(
-            na_ucx_addr->ucp_ep, force, &na_ucx_addr->close_request);
+        /* Close endpoint (if force is not passed, operations will flush).
+         * A replaced EP has no peer left to flush to. */
+        na_ucp_ep_close(na_ucx_addr->ucp_ep,
+            force ||
+                (hg_atomic_get32(&na_ucx_addr->status) & NA_UCX_ADDR_STALE),
+            &na_ucx_addr->close_request);
         na_ucx_addr->ucp_ep = NULL;
 
         if (na_ucx_addr->close_request != NULL) {
@@ -3428,7 +3500,7 @@ na_ucx_addr_reset(struct na_ucx_addr *na_ucx_addr, ucs_sock_addr_t *addr_key)
 {
     na_ucx_addr->ucp_ep = NULL;
     hg_atomic_init32(&na_ucx_addr->refcount, 1);
-    hg_atomic_init32(&na_ucx_addr->status, 0);
+    hg_atomic_init32(&na_ucx_addr->status, NA_UCX_ADDR_CONN_REF);
     na_ucx_addr->connect = false;
     na_ucx_addr->worker_addr_cached = false;
     na_ucx_addr->worker_addr_key =
@@ -3593,6 +3665,9 @@ na_ucx_rma(struct na_ucx_class NA_UNUSED *na_ucx_class, na_context_t *context,
     }
     NA_CHECK_SUBSYS_ERROR(rma, na_ucx_addr->ucp_ep == NULL, error, ret,
         NA_ADDRNOTAVAIL, "UCP endpoint is NULL for that address");
+    NA_CHECK_SUBSYS_ERROR(rma,
+        hg_atomic_get32(&na_ucx_addr->status) & NA_UCX_ADDR_STALE, error, ret,
+        NA_ADDRNOTAVAIL, "Address was replaced by a new connection");
 
     NA_UCX_OP_RESET(na_ucx_op_id, context, cb_type, callback, arg, na_ucx_addr);
 
@@ -4012,6 +4087,14 @@ na_ucx_finalize(na_class_t *na_class)
         na_ucx_addr_destroy(na_ucx_addr);
     }
 
+    /* Replaced addresses are no longer in the key map but keep their EP */
+    hg_hash_table_iterate(na_ucx_class->addr_map.ep_map, &addr_table_iter);
+    while (hg_hash_table_iter_has_more(&addr_table_iter)) {
+        struct na_ucx_addr *na_ucx_addr =
+            (struct na_ucx_addr *) hg_hash_table_iter_next(&addr_table_iter);
+        na_ucx_addr_destroy(na_ucx_addr);
+    }
+
     /* Same for addresses that were cached by packed worker address */
     hg_hash_table_iterate(na_ucx_class->addr_map.worker_map, &addr_table_iter);
     while (hg_hash_table_iter_has_more(&addr_table_iter)) {
@@ -4424,6 +4507,9 @@ na_ucx_msg_send_unexpected(na_class_t NA_UNUSED *na_class,
     }
     NA_CHECK_SUBSYS_ERROR(msg, na_ucx_addr->ucp_ep == NULL, error, ret,
         NA_ADDRNOTAVAIL, "UCP endpoint is NULL for that address");
+    NA_CHECK_SUBSYS_ERROR(msg,
+        hg_atomic_get32(&na_ucx_addr->status) & NA_UCX_ADDR_STALE, error, ret,
+        NA_ADDRNOTAVAIL, "Address was replaced by a new connection");
 
     NA_UCX_OP_RESET(na_ucx_op_id, context, NA_CB_SEND_UNEXPECTED, callback, arg,
         na_ucx_addr);
@@ -4508,6 +4594,9 @@ na_ucx_msg_send_expected(na_class_t NA_UNUSED *na_class, na_context_t *context,
     }
     NA_CHECK_SUBSYS_ERROR(msg, na_ucx_addr->ucp_ep == NULL, error, ret,
         NA_ADDRNOTAVAIL, "UCP endpoint is NULL for that address");
+    NA_CHECK_SUBSYS_ERROR(msg,
+        hg_atomic_get32(&na_ucx_addr->status) & NA_UCX_ADDR_STALE, error, ret,
+        NA_ADDRNOTAVAIL, "Address was replaced by a new connection");
 
     NA_UCX_OP_RESET(
         na_ucx_op_id, context, NA_CB_SEND_EXPECTED, callback, arg, na_ucx_addr);
